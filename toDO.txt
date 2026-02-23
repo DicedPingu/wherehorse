@@ -1,0 +1,6 @@
+# Less cos/sin
+Fix fitness
+Clean up uselessness
+More (and optional) stats during runtime
+Numba?
+Speedup
