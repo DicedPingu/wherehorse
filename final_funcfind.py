@@ -62,6 +62,10 @@ COMPLEXITY_WEIGHT = 0.35
 DIVERSITY_WEIGHT = 5.5
 SYMMETRY_WEIGHT = 80.0
 TOURNAMENT_SIZE = 7
+DEFAULT_CROSSOVER_RATE = 0.35
+DEFAULT_STAGNATION_WINDOW = 30
+DEFAULT_STAGNATION_THRESHOLD = 1.0
+DEFAULT_STAGNATION_REFRESH = 0.15
 
 OUTPUT_ABS_CLIP = 20_000
 POW_EXP_CLIP = 5
@@ -722,6 +726,36 @@ def _build_symmetry_pairs(width: int, height: int) -> tuple[np.ndarray, np.ndarr
     return np.asarray(left, dtype=np.int64), np.asarray(right, dtype=np.int64)
 
 
+PathRef = tuple[str, ...]
+
+
+def _collect_subtree_paths(node: Node, path: PathRef = ()) -> list[PathRef]:
+    paths: list[PathRef] = [path]
+    if isinstance(node, BinaryNode):
+        paths.extend(_collect_subtree_paths(node.left, path + ("left",)))
+        paths.extend(_collect_subtree_paths(node.right, path + ("right",)))
+    return paths
+
+
+def _get_subtree(node: Node, path: PathRef) -> Node:
+    current = node
+    for step in path:
+        current = getattr(current, step)
+    return current
+
+
+def _replace_subtree(root: Node, path: PathRef, replacement: Node) -> Node:
+    if not path:
+        return replacement
+
+    new_root = root.clone()
+    parent = new_root
+    for step in path[:-1]:
+        parent = getattr(parent, step)
+    setattr(parent, path[-1], replacement)
+    return new_root
+
+
 @dataclass(slots=True)
 class Individual:
     gene: Node
@@ -745,6 +779,10 @@ class GeneticApproximator:
         diversity_weight: float,
         symmetry_weight: float,
         workers: int,
+        crossover_rate: float,
+        stagnation_window: int,
+        stagnation_threshold: float,
+        stagnation_refresh: float,
         verbose: bool,
     ) -> None:
         self.grid = grid
@@ -774,6 +812,11 @@ class GeneticApproximator:
         self.complexity_weight = complexity_weight
         self.diversity_weight = diversity_weight
         self.symmetry_weight = symmetry_weight
+        self.crossover_rate = max(0.0, min(1.0, crossover_rate))
+        self.stagnation_window = max(2, stagnation_window)
+        self.stagnation_threshold = stagnation_threshold
+        self.stagnation_refresh = max(0.02, min(0.50, stagnation_refresh))
+        self.stagnation_trigger_rounds = max(6, self.stagnation_window // 4)
         self.workers = max(1, workers)
         self.verbose = verbose
 
@@ -781,9 +824,12 @@ class GeneticApproximator:
 
         self.best_fitness_history: list[float] = []
         self.stagnation_counter = 0
+        self.last_recent_improvement = 0.0
         self.best_seen: Individual | None = None
         self.generations_completed = 0
         self.exact_match = False
+        self.crossover_events = 0
+        self.escape_events = 0
 
         self.population: list[Individual] = []
 
@@ -851,6 +897,89 @@ class GeneticApproximator:
             elite.operands = parent.operands.copy()
         return elite
 
+    def _bounded_gene(self, gene: Node) -> Node:
+        if gene.get_depth() > MAX_DEPTH:
+            gene = random_node(max_depth=MAX_DEPTH)
+        if gene.contains_variable():
+            return gene
+        if gene.get_depth() < MAX_DEPTH:
+            candidate = AddNode(gene.clone(), VarNode(0))
+            if candidate.get_depth() <= MAX_DEPTH:
+                return candidate
+        for _ in range(8):
+            candidate = random_node(max_depth=MAX_DEPTH)
+            if candidate.contains_variable():
+                return candidate
+        return VarNode(0)
+
+    def crossover(self, parent_a: Individual, parent_b: Individual, max_attempts: int = 8) -> Node:
+        paths_a = _collect_subtree_paths(parent_a.gene)
+        paths_b = _collect_subtree_paths(parent_b.gene)
+
+        for _ in range(max_attempts):
+            path_a = random.choice(paths_a)
+            path_b = random.choice(paths_b)
+            donor_subtree = _get_subtree(parent_b.gene, path_b).clone()
+            candidate = _replace_subtree(parent_a.gene, path_a, donor_subtree)
+            if candidate.get_depth() <= MAX_DEPTH and candidate.contains_variable():
+                return candidate
+
+        return parent_a.gene.mutate(self.mutation_rate)
+
+    def _targeted_edit(self, gene: Node) -> Node:
+        working = gene.clone()
+        roll = random.random()
+
+        if roll < 0.40:
+            const_paths = [
+                path for path in _collect_subtree_paths(working)
+                if isinstance(_get_subtree(working, path), ConstNode)
+            ]
+            if const_paths:
+                path = random.choice(const_paths)
+                old_const = _get_subtree(working, path)
+                assert isinstance(old_const, ConstNode)
+                jitter = random.choice((-2, -1, 1, 2))
+                replacement = ConstNode(max(-6, min(12, old_const.value + jitter)))
+                return self._bounded_gene(_replace_subtree(working, path, replacement))
+
+        if roll < 0.80:
+            binary_paths = [
+                path for path in _collect_subtree_paths(working)
+                if isinstance(_get_subtree(working, path), BinaryNode)
+            ]
+            if binary_paths:
+                path = random.choice(binary_paths)
+                old_node = _get_subtree(working, path)
+                assert isinstance(old_node, BinaryNode)
+                alternatives = [op for op in BINARY_NODE_TYPES if not isinstance(old_node, op)]
+                replacement_op = random.choice(alternatives)
+                replacement = replacement_op(old_node.left.clone(), old_node.right.clone())
+                return self._bounded_gene(_replace_subtree(working, path, replacement))
+
+        random_paths = _collect_subtree_paths(working)
+        path = random.choice(random_paths)
+        replacement = random_node(max_depth=min(3, MAX_DEPTH))
+        return self._bounded_gene(_replace_subtree(working, path, replacement))
+
+    def _apply_stagnation_escape(self) -> None:
+        self.escape_events += 1
+        replace_count = max(1, int(self.population_size * self.stagnation_refresh))
+        start_idx = max(0, self.population_size - replace_count)
+
+        for idx in range(start_idx, self.population_size):
+            if random.random() < 0.70:
+                donor = self.population[random.randrange(max(2, self.population_size // 2))]
+                new_gene = self._targeted_edit(donor.gene)
+            elif random.random() < 0.50:
+                new_gene = create_symmetric_node(random.choice(PATTERN_TYPES))
+            else:
+                new_gene = random_node(max_depth=MAX_DEPTH)
+
+            self.population[idx] = Individual(gene=self._bounded_gene(new_gene))
+
+        self.mutation_rate = min(0.72, self.mutation_rate * 1.08)
+
     def reproduce(self) -> None:
         survivors = max(2, int(self.population_size * self.survival_rate))
         elite_count = min(12, survivors, self.population_size)
@@ -861,34 +990,44 @@ class GeneticApproximator:
             new_population.append(self._clone_elite(self.population[i]))
 
         while len(new_population) < self.population_size:
-            parent = self.tournament_selection()
-            mutated_gene = parent.gene.mutate(self.mutation_rate)
-            new_population.append(Individual(gene=mutated_gene))
+            use_crossover = random.random() < self.crossover_rate and len(self.population) > 1
+            if use_crossover:
+                parent_a = self.tournament_selection()
+                parent_b = self.tournament_selection()
+                child_gene = self.crossover(parent_a, parent_b)
+                child_gene = child_gene.mutate(max(0.04, self.mutation_rate * 0.35))
+                self.crossover_events += 1
+            else:
+                parent = self.tournament_selection()
+                child_gene = parent.gene.mutate(self.mutation_rate)
+
+            new_population.append(Individual(gene=self._bounded_gene(child_gene)))
 
         self.population = new_population
 
     def adapt_parameters(self) -> None:
-        if len(self.best_fitness_history) >= 30:
-            recent_improvement = self.best_fitness_history[-30] - self.best_fitness_history[-1]
+        if len(self.best_fitness_history) >= self.stagnation_window:
+            recent_improvement = (
+                self.best_fitness_history[-self.stagnation_window] - self.best_fitness_history[-1]
+            )
+            self.last_recent_improvement = recent_improvement
 
-            if recent_improvement < 1.0:
+            if recent_improvement < self.stagnation_threshold:
                 self.stagnation_counter += 1
-                self.mutation_rate = min(0.65, self.mutation_rate * 1.03)
+                self.mutation_rate = min(0.68, self.mutation_rate * 1.02)
             else:
                 self.stagnation_counter = max(0, self.stagnation_counter - 1)
-                self.mutation_rate = max(0.12, self.mutation_rate * 0.985)
+                self.mutation_rate = max(0.10, self.mutation_rate * 0.992)
 
-        if self.stagnation_counter > 120:
-            replace_count = max(1, self.population_size // 5)
-            for i in range(replace_count):
-                idx = self.population_size - 1 - i
-                if random.random() < 0.65:
-                    self.population[idx] = Individual(
-                        gene=create_symmetric_node(random.choice(PATTERN_TYPES))
-                    )
-                else:
-                    self.population[idx] = Individual(gene=random_node(max_depth=MAX_DEPTH))
-            self.stagnation_counter = 0
+            if self.stagnation_counter >= self.stagnation_trigger_rounds:
+                self._apply_stagnation_escape()
+                self.stagnation_counter = 0
+
+        if self.mutation_rate > self.base_mutation_rate:
+            self.mutation_rate = max(self.base_mutation_rate, self.mutation_rate * 0.998)
+        else:
+            self.mutation_rate = min(self.base_mutation_rate, self.mutation_rate * 1.001)
+        self.mutation_rate = min(0.75, max(0.08, self.mutation_rate))
 
     def run(self, generations: int) -> Individual:
         start_time = time.perf_counter()
@@ -914,6 +1053,8 @@ class GeneticApproximator:
                         f"sym={best.symmetry_error:7.0f} "
                         f"cx={best.complexity:4d} "
                         f"mut={self.mutation_rate:0.3f} "
+                        f"cross={self.crossover_events:6d} "
+                        f"esc={self.escape_events:3d} "
                         f"rate={rate:7.2f} g/s"
                     )
 
@@ -1106,6 +1247,24 @@ def _auto_workers(population: int) -> int:
     return 1
 
 
+def _runtime_warning_for_backend(acceleration_backend: str) -> str | None:
+    if acceleration_backend != "python-fallback":
+        return None
+    if sys.version_info[:2] < (3, 15):
+        return None
+    return (
+        "Warning: running in Python fallback mode on Python 3.15+ "
+        "(Numba unavailable). Expect slower runtime than Python 3.14 + Numba."
+    )
+
+
+def _resolve_seed_sequence(base_seed: int | None, count: int) -> list[int | None]:
+    if count <= 1:
+        return [base_seed]
+    start = 0 if base_seed is None else base_seed
+    return [start + idx for idx in range(count)]
+
+
 def _predict_grid(best: Individual, width: int, height: int) -> list[list[int]]:
     if best.last_outputs is None:
         return [[0 for _ in range(width)] for _ in range(height)]
@@ -1126,11 +1285,14 @@ def _difference_grid(predicted: list[list[int]], target: list[list[int]]) -> lis
 
 def _print_human_report(
     *,
-    best: Individual,
     expression: str,
     target: list[list[int]],
     predicted: list[list[int]],
     diff: list[list[int]],
+    fitness: float,
+    raw_error: float,
+    symmetry_error: float,
+    complexity: int,
     elapsed: float,
     generations: int,
     exact_match: bool,
@@ -1139,20 +1301,25 @@ def _print_human_report(
     seed: int | None,
     verbose: bool,
     acceleration_backend: str,
+    crossover_events: int,
+    escape_events: int,
+    recent_improvement: float,
 ) -> None:
     print("=" * 72)
     print("Final FuncFind Results")
     print("=" * 72)
     print(f"Expression: {expression}")
-    print(f"Fitness: {best.fitness:.4f}")
-    print(f"Raw error: {best.raw_error:.0f}")
-    print(f"Symmetry error: {best.symmetry_error:.0f}")
-    print(f"Complexity: {best.complexity}")
+    print(f"Fitness: {fitness:.4f}")
+    print(f"Raw error: {raw_error:.0f}")
+    print(f"Symmetry error: {symmetry_error:.0f}")
+    print(f"Complexity: {complexity}")
     print(f"Exact match: {exact_match}")
     print(f"Elapsed: {elapsed:.2f}s")
     print(f"Generations executed: {generations}")
     print(f"Workers: {workers} | Fast mode: {fast_mode}")
     print(f"Acceleration backend: {acceleration_backend}")
+    print(f"Crossover events: {crossover_events} | Escape events: {escape_events}")
+    print(f"Recent improvement window delta: {recent_improvement:.3f}")
     print(f"Free-threaded runtime: {_is_free_threaded()}")
     if seed is not None:
         print(f"Seed: {seed}")
@@ -1179,6 +1346,147 @@ def _print_human_report(
         print("  ", " ".join(rendered))
 
     print("=" * 72)
+
+
+def _print_multi_seed_summary(
+    *,
+    aggregate: dict[str, object],
+    runs: list[dict[str, object]],
+    acceleration_backend: str,
+    multi_seed_count: int,
+    base_seed: int | None,
+    verbose: bool,
+    runtime_warning: str | None,
+) -> None:
+    print("=" * 72)
+    print("Final FuncFind Multi-Seed Summary")
+    print("=" * 72)
+    print(f"Runs: {multi_seed_count} | Acceleration backend: {acceleration_backend}")
+    if base_seed is not None:
+        print(f"Base seed: {base_seed} (repeatable sequence)")
+    if runtime_warning:
+        print(runtime_warning)
+    print(
+        "Raw error stats: "
+        f"median={aggregate['median_raw_error']:.3f} "
+        f"mean={aggregate['mean_raw_error']:.3f} "
+        f"std={aggregate['std_raw_error']:.3f}"
+    )
+    print(
+        "Best run: "
+        f"seed={aggregate['best_seed']} "
+        f"raw={aggregate['best_raw_error']:.3f} "
+        f"fit={aggregate['best_fitness']:.3f}"
+    )
+    print(f"Best expression: {aggregate['best_expression']}")
+    if verbose:
+        print("\nPer-seed results:")
+        for entry in runs:
+            print(
+                f"  seed={entry['seed']} "
+                f"raw={entry['raw_error']:.3f} "
+                f"fit={entry['fitness']:.3f} "
+                f"time={entry['elapsed_seconds']:.3f}s "
+                f"exact={entry['exact_match']}"
+            )
+    print("=" * 72)
+
+
+def _run_solver_once(
+    *,
+    target_grid: list[list[int]],
+    population: int,
+    generations: int,
+    mutation_rate: float,
+    workers: int,
+    acceleration_backend: str,
+    seed: int | None,
+    verbose: bool,
+    crossover_rate: float,
+    stagnation_window: int,
+    stagnation_threshold: float,
+    stagnation_refresh: float,
+) -> dict[str, object]:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed & 0xFFFFFFFF)
+
+    solver = GeneticApproximator(
+        grid=target_grid,
+        population_size=population,
+        mutation_rate=mutation_rate,
+        survival_rate=SURVIVAL_RATE,
+        complexity_weight=COMPLEXITY_WEIGHT,
+        diversity_weight=DIVERSITY_WEIGHT,
+        symmetry_weight=SYMMETRY_WEIGHT,
+        workers=workers,
+        crossover_rate=crossover_rate,
+        stagnation_window=stagnation_window,
+        stagnation_threshold=stagnation_threshold,
+        stagnation_refresh=stagnation_refresh,
+        verbose=verbose,
+    )
+
+    started = time.perf_counter()
+    best = solver.run(generations=generations)
+    elapsed = time.perf_counter() - started
+
+    expression = simplify_node(best.gene)
+    predicted = _predict_grid(best, solver.width, solver.height)
+    diff = _difference_grid(predicted, target_grid)
+    exact_match = bool(
+        best.last_outputs is not None and np.array_equal(best.last_outputs, solver.expected_flat)
+    )
+
+    report = {
+        "expression": expression,
+        "fitness": float(best.fitness),
+        "raw_error": float(best.raw_error),
+        "symmetry_error": float(best.symmetry_error),
+        "complexity": int(best.complexity),
+        "exact_match": exact_match,
+        "elapsed_seconds": elapsed,
+        "generations_executed": int(solver.generations_completed),
+        "population": population,
+        "workers": workers,
+        "fast_mode": False,
+        "seed": seed,
+        "numba_available": HAS_NUMBA,
+        "acceleration_backend": acceleration_backend,
+        "free_threaded_runtime": _is_free_threaded(),
+        "target_shape": [solver.height, solver.width],
+        "target_grid": target_grid,
+        "predicted_grid": predicted,
+        "difference_grid": diff,
+        "crossover_events": solver.crossover_events,
+        "escape_events": solver.escape_events,
+        "recent_improvement_window_delta": solver.last_recent_improvement,
+    }
+    return report
+
+
+def _aggregate_multi_seed(
+    run_reports: list[dict[str, object]],
+) -> dict[str, object]:
+    raw_errors = np.asarray([float(r["raw_error"]) for r in run_reports], dtype=np.float64)
+    fitnesses = np.asarray([float(r["fitness"]) for r in run_reports], dtype=np.float64)
+
+    best_idx = min(
+        range(len(run_reports)),
+        key=lambda idx: (float(run_reports[idx]["raw_error"]), float(run_reports[idx]["fitness"])),
+    )
+    best = run_reports[best_idx]
+
+    return {
+        "median_raw_error": float(np.median(raw_errors)),
+        "mean_raw_error": float(np.mean(raw_errors)),
+        "std_raw_error": float(np.std(raw_errors)),
+        "best_raw_error": float(best["raw_error"]),
+        "best_fitness": float(best["fitness"]),
+        "best_seed": best["seed"],
+        "best_expression": best["expression"],
+        "median_fitness": float(np.median(fitnesses)),
+    }
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1234,6 +1542,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional JSON or Python-literal file containing the target grid.",
     )
+    parser.add_argument(
+        "--multi-seed",
+        type=int,
+        default=1,
+        help="Run multiple repeatable seeds and report aggregate metrics.",
+    )
+    parser.add_argument(
+        "--crossover-rate",
+        type=float,
+        default=DEFAULT_CROSSOVER_RATE,
+        help=f"Crossover probability per child (default: {DEFAULT_CROSSOVER_RATE}).",
+    )
+    parser.add_argument(
+        "--stagnation-window",
+        type=int,
+        default=DEFAULT_STAGNATION_WINDOW,
+        help=f"Generations for stagnation window (default: {DEFAULT_STAGNATION_WINDOW}).",
+    )
+    parser.add_argument(
+        "--stagnation-threshold",
+        type=float,
+        default=DEFAULT_STAGNATION_THRESHOLD,
+        help=f"Minimum improvement in window before escape triggers (default: {DEFAULT_STAGNATION_THRESHOLD}).",
+    )
+    parser.add_argument(
+        "--stagnation-refresh",
+        type=float,
+        default=DEFAULT_STAGNATION_REFRESH,
+        help=f"Fraction of worst population refreshed during escape (default: {DEFAULT_STAGNATION_REFRESH}).",
+    )
 
     return parser.parse_args(argv)
 
@@ -1247,13 +1585,18 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--generations must be >= 1")
     if args.workers < 0:
         raise SystemExit("--workers must be >= 0")
+    if args.multi_seed < 1:
+        raise SystemExit("--multi-seed must be >= 1")
+    if not 0.0 <= args.crossover_rate <= 1.0:
+        raise SystemExit("--crossover-rate must be between 0.0 and 1.0")
+    if args.stagnation_window < 2:
+        raise SystemExit("--stagnation-window must be >= 2")
+    if args.stagnation_refresh <= 0 or args.stagnation_refresh >= 1:
+        raise SystemExit("--stagnation-refresh must be > 0 and < 1")
 
     _enforce_acceleration_policy()
     acceleration_backend = "numba-jit" if HAS_NUMBA else "python-fallback"
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed & 0xFFFFFFFF)
+    runtime_warning = _runtime_warning_for_backend(acceleration_backend)
 
     target_grid = GRID
     if args.target_file is not None:
@@ -1273,8 +1616,12 @@ def main(argv: list[str] | None = None) -> int:
         mutation_rate = min(0.55, mutation_rate * 1.15)
 
     workers = args.workers if args.workers > 0 else _auto_workers(population)
+    seed_sequence = _resolve_seed_sequence(args.seed, args.multi_seed)
+    base_seed = seed_sequence[0] if args.multi_seed > 1 else args.seed
 
     if not args.json:
+        if runtime_warning is not None:
+            print(runtime_warning)
         print("=" * 72)
         print("Final FuncFind")
         print("=" * 72)
@@ -1283,77 +1630,106 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Acceleration backend: {acceleration_backend}")
         print(f"Population: {population} | Generations: {generations}")
         print(f"Workers: {workers} | Fast mode: {args.fast}")
+        print(f"Multi-seed: {args.multi_seed}")
         print(f"Free-threaded runtime: {_is_free_threaded()}")
-        if args.seed is not None:
-            print(f"Seed: {args.seed}")
+        if base_seed is not None:
+            print(f"Base seed: {base_seed}")
         if len(target_grid) == len(target_grid[0]):
             print("Symmetry scoring: enabled")
         else:
             print("Symmetry scoring: disabled (non-square target)")
         print()
 
-    solver = GeneticApproximator(
-        grid=target_grid,
-        population_size=population,
-        mutation_rate=mutation_rate,
-        survival_rate=SURVIVAL_RATE,
-        complexity_weight=COMPLEXITY_WEIGHT,
-        diversity_weight=DIVERSITY_WEIGHT,
-        symmetry_weight=SYMMETRY_WEIGHT,
-        workers=workers,
-        verbose=args.verbose and not args.json,
-    )
-
-    started = time.perf_counter()
-    best = solver.run(generations=generations)
-    elapsed = time.perf_counter() - started
-
-    expression = simplify_node(best.gene)
-    predicted = _predict_grid(best, solver.width, solver.height)
-    diff = _difference_grid(predicted, target_grid)
-
-    report = {
-        "expression": expression,
-        "fitness": float(best.fitness),
-        "raw_error": float(best.raw_error),
-        "symmetry_error": float(best.symmetry_error),
-        "complexity": int(best.complexity),
-        "exact_match": bool(
-            best.last_outputs is not None and np.array_equal(best.last_outputs, solver.expected_flat)
-        ),
-        "elapsed_seconds": elapsed,
-        "generations_executed": int(solver.generations_completed),
-        "population": population,
-        "workers": workers,
-        "fast_mode": bool(args.fast),
-        "seed": args.seed,
-        "numba_available": HAS_NUMBA,
-        "acceleration_backend": acceleration_backend,
-        "free_threaded_runtime": _is_free_threaded(),
-        "target_shape": [solver.height, solver.width],
-        "target_grid": target_grid,
-        "predicted_grid": predicted,
-        "difference_grid": diff,
-    }
-
-    if args.json:
-        print(json.dumps(report, indent=2))
-    else:
-        _print_human_report(
-            best=best,
-            expression=expression,
-            target=target_grid,
-            predicted=predicted,
-            diff=diff,
-            elapsed=elapsed,
-            generations=solver.generations_completed,
-            exact_match=report["exact_match"],
+    run_reports: list[dict[str, object]] = []
+    for run_seed in seed_sequence:
+        run_report = _run_solver_once(
+            target_grid=target_grid,
+            population=population,
+            generations=generations,
+            mutation_rate=mutation_rate,
             workers=workers,
-            fast_mode=args.fast,
-            seed=args.seed,
-            verbose=args.verbose,
             acceleration_backend=acceleration_backend,
+            seed=run_seed,
+            verbose=args.verbose and not args.json,
+            crossover_rate=args.crossover_rate,
+            stagnation_window=args.stagnation_window,
+            stagnation_threshold=args.stagnation_threshold,
+            stagnation_refresh=args.stagnation_refresh,
         )
+        run_report["fast_mode"] = bool(args.fast)
+        if runtime_warning is not None:
+            run_report["runtime_warning"] = runtime_warning
+        run_reports.append(run_report)
+
+    if args.multi_seed == 1:
+        report = run_reports[0]
+        if args.json:
+            report["mode"] = "single"
+            print(json.dumps(report, indent=2))
+        else:
+            _print_human_report(
+                expression=str(report["expression"]),
+                target=target_grid,
+                predicted=report["predicted_grid"],  # type: ignore[arg-type]
+                diff=report["difference_grid"],  # type: ignore[arg-type]
+                fitness=float(report["fitness"]),
+                raw_error=float(report["raw_error"]),
+                symmetry_error=float(report["symmetry_error"]),
+                complexity=int(report["complexity"]),
+                elapsed=float(report["elapsed_seconds"]),
+                generations=int(report["generations_executed"]),
+                exact_match=bool(report["exact_match"]),
+                workers=workers,
+                fast_mode=args.fast,
+                seed=report["seed"] if isinstance(report["seed"], int) else None,
+                verbose=args.verbose,
+                acceleration_backend=acceleration_backend,
+                crossover_events=int(report["crossover_events"]),
+                escape_events=int(report["escape_events"]),
+                recent_improvement=float(report["recent_improvement_window_delta"]),
+            )
+    else:
+        aggregate = _aggregate_multi_seed(run_reports)
+        compact_runs = [
+            {
+                "seed": report["seed"],
+                "raw_error": float(report["raw_error"]),
+                "fitness": float(report["fitness"]),
+                "elapsed_seconds": float(report["elapsed_seconds"]),
+                "exact_match": bool(report["exact_match"]),
+            }
+            for report in run_reports
+        ]
+
+        output = {
+            "mode": "multi-seed",
+            "multi_seed_count": args.multi_seed,
+            "base_seed": base_seed,
+            "acceleration_backend": acceleration_backend,
+            "aggregate": aggregate,
+            "runs": compact_runs,
+            "population": population,
+            "generations": generations,
+            "workers": workers,
+            "fast_mode": bool(args.fast),
+            "numba_available": HAS_NUMBA,
+            "target_shape": [len(target_grid), len(target_grid[0])],
+        }
+        if runtime_warning is not None:
+            output["runtime_warning"] = runtime_warning
+
+        if args.json:
+            print(json.dumps(output, indent=2))
+        else:
+            _print_multi_seed_summary(
+                aggregate=aggregate,
+                runs=compact_runs,
+                acceleration_backend=acceleration_backend,
+                multi_seed_count=args.multi_seed,
+                base_seed=base_seed if isinstance(base_seed, int) else None,
+                verbose=args.verbose,
+                runtime_warning=runtime_warning,
+            )
 
     return 0
 
