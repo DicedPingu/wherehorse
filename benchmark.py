@@ -37,7 +37,7 @@ def print_system_info():
                 print("Mode: Standard Python (GIL enabled)")
                 print("Executor: ProcessPoolExecutor")
             else:
-                print("Mode: Free-threaded Python 3.14t (no GIL!)")
+                print("Mode: Free-threaded Python 3.15t (no GIL!)")
                 print("Executor: ThreadPoolExecutor with true parallelism")
         except:
             print("Mode: Standard Python")
@@ -115,11 +115,11 @@ def run_benchmark():
     print(f"Performance: {rating} {emoji}")
     print()
 
-    # Expected improvements with Python 3.14t
+    # Expected improvements with Python 3.15t
     if hasattr(sys, '_is_gil_enabled'):
         try:
             if sys._is_gil_enabled():
-                print("💡 TIP: With Python 3.14t (free-threaded), expect:")
+                print("💡 TIP: With Python 3.15t (free-threaded), expect:")
                 estimated_3_14t = evaluations_per_second * 3  # Conservative 3x
                 print(f"   ~{estimated_3_14t:,.0f} evaluations/second (3-5x faster)")
         except:

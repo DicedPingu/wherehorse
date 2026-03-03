@@ -387,7 +387,7 @@ class GeneticApproximator:
         self.complexity_weight = complexity_weight
         self.diversity_weight = diversity_weight
 
-        # Detect free-threading mode (Python 3.14+)
+        # Detect free-threading mode (Python 3.15+)
         self.use_free_threading = (
             hasattr(sys, '_is_gil_enabled') and not sys._is_gil_enabled()
         )

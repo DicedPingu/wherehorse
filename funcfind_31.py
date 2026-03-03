@@ -387,7 +387,7 @@ class GeneticApproximator:
         self.complexity_weight = complexity_weight
         self.diversity_weight = diversity_weight
 
-        # Detect free-threading mode (Python 3.14+)
+        # Detect free-threading mode (Python 3.15+)
         self.use_free_threading = (
             hasattr(sys, '_is_gil_enabled') and not sys._is_gil_enabled()
         )
@@ -425,12 +425,12 @@ class GeneticApproximator:
     def evaluate_population(self) -> None:
         """
         Evaluate fitness for the whole population using optimal parallelization.
-        Uses free-threaded mode (Python 3.14+) if available for true parallelism,
+        Uses free-threaded mode (Python 3.15+) if available for true parallelism,
         otherwise falls back to ProcessPoolExecutor to bypass the GIL.
         """
         # Choose executor based on free-threading availability
         if self.use_free_threading:
-            # True parallelism with threads (Python 3.14t free-threaded build)
+            # True parallelism with threads (Python 3.15t free-threaded build)
             executor_class = ThreadPoolExecutor
             max_workers = os.cpu_count() - 2 or 6
         else:

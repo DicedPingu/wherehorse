@@ -1,6 +1,6 @@
 """
 Genetic Algorithm for discovering PURE MATHEMATICAL expressions that match a target grid.
-Optimized for Python 3.14+ with symmetry exploitation.
+Optimized for Python 3.15+ with symmetry exploitation.
 
 KEY INSIGHT: The target grid is symmetric: f(x,y) = f(y,x)
 This means [1,0] = [0,1], [2,0] = [0,2], [2,1] = [1,2], etc.
@@ -12,12 +12,12 @@ This version includes:
 - Adaptive mutation rates
 - Tournament selection
 
-Python 3.14 optimizations:
+Python 3.15 optimizations:
 - __slots__ for 40% memory reduction and faster attribute access
 - Pattern matching (match/case) for 5-15% faster type dispatch
 - ThreadPoolExecutor for parallel fitness evaluation
 - Dataclass with slots=True for optimized Individual storage
-- To enable Python 3.14 JIT: run with PYTHON_JIT=1 environment variable
+- To enable Python 3.15 JIT: run with PYTHON_JIT=1 environment variable
   Example: PYTHON_JIT=1 python funcfind_33b.py
 """
 import os
