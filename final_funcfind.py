@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import json
 import os
 import random
@@ -81,6 +82,7 @@ OUT_OF_RANGE_LOW = -2
 OUT_OF_RANGE_HIGH = 10
 RANGE_TARGET = 3
 RANGE_WEIGHT = 0.25
+SCORE_CACHE_LIMIT = 20_000
 
 PATTERN_TYPES = (
     "x_plus_y",
@@ -313,15 +315,10 @@ def _enforce_acceleration_policy() -> str | None:
         _ensure_numba_ready()
         return None
 
-    if sys.version_info[:2] <= (3, 14):
-        detail = f" Original import error: {NUMBA_IMPORT_ERROR}" if NUMBA_IMPORT_ERROR else ""
-        raise SystemExit(
-            "Numba is required on Python 3.14. Install dependencies with `uv sync`." + detail
-        )
-
+    detail = f" Original import error: {NUMBA_IMPORT_ERROR}" if NUMBA_IMPORT_ERROR else ""
     return (
-        "Warning: running Python fallback mode on Python 3.15+ "
-        "(Numba unavailable). Runtime will be slower than Python 3.14 + Numba."
+        "Warning: running Python fallback mode (Numba unavailable). "
+        "Use a runtime with supported acceleration for maximum speed." + detail
     )
 
 
@@ -758,6 +755,13 @@ class GeneticApproximator:
         self.exact_match = False
         self.crossover_events = 0
         self.escape_events = 0
+        self.score_cache_hits = 0
+        self.score_cache_misses = 0
+        self._score_cache: OrderedDict[
+            tuple[bytes, bytes],
+            tuple[float, float, float, np.ndarray, int],
+        ] = OrderedDict()
+        self._score_cache_limit = SCORE_CACHE_LIMIT
 
         self.population: list[Individual] = []
         seed_count = self.population_size // 2
@@ -768,11 +772,33 @@ class GeneticApproximator:
             self.population.append(Individual(gene=random_node(max_depth=MAX_DEPTH)))
 
     def _score_individual(self, individual: Individual) -> None:
+        if (
+            individual.last_outputs is not None
+            and individual.opcodes is not None
+            and individual.operands is not None
+            and individual.fitness != float("inf")
+        ):
+            return
+
         if individual.opcodes is None or individual.operands is None:
             opcodes, operands = compile_gene_to_postfix(individual.gene)
             individual.opcodes = opcodes
             individual.operands = operands
 
+        cache_key = (individual.opcodes.tobytes(), individual.operands.tobytes())
+        cached = self._score_cache.get(cache_key)
+        if cached is not None:
+            self.score_cache_hits += 1
+            self._score_cache.move_to_end(cache_key)
+            fitness, raw_error, sym_error, outputs, complexity = cached
+            individual.fitness = fitness
+            individual.raw_error = raw_error
+            individual.symmetry_error = sym_error
+            individual.last_outputs = outputs
+            individual.complexity = complexity
+            return
+
+        self.score_cache_misses += 1
         fitness, raw_error, sym_error, outputs = _score_program(
             individual.opcodes,
             individual.operands,
@@ -792,11 +818,26 @@ class GeneticApproximator:
             np.int64(POW_EXP_CLIP),
         )
 
-        individual.fitness = float(fitness)
-        individual.raw_error = float(raw_error)
-        individual.symmetry_error = float(sym_error)
+        scored_fitness = float(fitness)
+        scored_raw_error = float(raw_error)
+        scored_symmetry_error = float(sym_error)
+        scored_complexity = int(individual.opcodes.shape[0])
+
+        individual.fitness = scored_fitness
+        individual.raw_error = scored_raw_error
+        individual.symmetry_error = scored_symmetry_error
         individual.last_outputs = outputs
-        individual.complexity = int(individual.opcodes.shape[0])
+        individual.complexity = scored_complexity
+
+        self._score_cache[cache_key] = (
+            scored_fitness,
+            scored_raw_error,
+            scored_symmetry_error,
+            outputs,
+            scored_complexity,
+        )
+        if len(self._score_cache) > self._score_cache_limit:
+            self._score_cache.popitem(last=False)
 
     def evaluate_population(self) -> None:
         for individual in self.population:
@@ -812,9 +853,14 @@ class GeneticApproximator:
 
     def _clone_elite(self, parent: Individual) -> Individual:
         elite = Individual(gene=parent.gene.clone())
+        elite.fitness = parent.fitness
+        elite.raw_error = parent.raw_error
+        elite.symmetry_error = parent.symmetry_error
+        elite.complexity = parent.complexity
+        elite.last_outputs = parent.last_outputs
         if parent.opcodes is not None and parent.operands is not None:
-            elite.opcodes = parent.opcodes.copy()
-            elite.operands = parent.operands.copy()
+            elite.opcodes = parent.opcodes
+            elite.operands = parent.operands
         return elite
 
     def _bounded_gene(self, gene: Node) -> Node:
@@ -1050,6 +1096,9 @@ def _run_once(
         "expression": best.gene.to_string(),
         "crossover_events": int(solver.crossover_events),
         "escape_events": int(solver.escape_events),
+        "score_cache_hits": int(solver.score_cache_hits),
+        "score_cache_misses": int(solver.score_cache_misses),
+        "score_cache_size": int(len(solver._score_cache)),
         "recent_improvement_window_delta": float(solver.last_recent_improvement),
         "acceleration_backend": backend,
     }
