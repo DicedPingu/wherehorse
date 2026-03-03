@@ -1,42 +1,70 @@
-# TODO - Final FuncFind Improvements
+# TODO - Final FuncFind Roadmap
 
-## High Priority
-- [ ] Add crossover (recombination) between parents, not only mutation.
-- [ ] Add a true benchmark command that compares `numba-jit` vs Python fallback on the same seed.
+## Completed (Current State)
+- [x] Add subtree crossover (recombination) in reproduction flow.
+- [x] Add moderate targeted stagnation escape (constant/operator/subtree edits + partial refresh).
+- [x] Add multi-seed mode (`--multi-seed N`) with repeatable seed sequencing.
+- [x] Add aggregate multi-seed reporting (median/mean/std raw error + best seed/expression).
+- [x] Add crossover/stagnation tuning flags:
+  - `--crossover-rate`
+  - `--stagnation-window`
+  - `--stagnation-threshold`
+  - `--stagnation-refresh`
+- [x] Keep Python 3.14 strict Numba policy.
+- [x] Add single startup warning for Python 3.15 fallback mode (+ `runtime_warning` field in JSON mode).
+- [x] Keep pure math operator set (no trig/cos/sin path).
+
+## Quality Gate Status
+- [x] Baseline comparison run at fixed budget (`population=500`, `generations=1500`, workers=1).
+- [x] Medium sweep completed (20 seeds).
+- [x] Median raw-error improvement target met (>10%).
+- [x] Latest measured result:
+  - Baseline median raw error: `110.0`
+  - New median raw error: `57.5`
+  - Improvement: `47.73%`
+
+## Next Priority (High Impact)
+- [ ] Add a true benchmark command that compares `numba-jit` vs Python fallback on the same seeds and config.
 - [ ] Add checkpoint save/resume (`--checkpoint-out`, `--checkpoint-in`) for long runs.
-- [ ] Add stagnation escape strategy with targeted operator/constant mutation instead of random reset.
-- [ ] Add multi-seed run mode (`--multi-seed N`) and report best/mean/std fitness.
+- [ ] Add automatic A/B mode for strategy tuning (mutation-only vs crossover+escape) with summary output.
+- [ ] Add significance reporting for multi-seed comparisons (median delta + confidence indicator).
 
-## Accuracy and Search Quality
-- [ ] Add adaptive fitness weights over time (early exploration, late exploitation).
+## Search Quality Backlog
+- [ ] Add adaptive fitness-weight scheduling across generations (exploration -> exploitation).
 - [ ] Add operator probability scheduling by generation.
-- [ ] Add optional semantic simplification pass before scoring duplicate expressions.
 - [ ] Add novelty archive to preserve diverse high-value structures.
-- [ ] Add Pareto mode (error vs complexity) to avoid overfitting to one scalar score.
+- [ ] Add Pareto mode (raw error vs complexity) to avoid single-scalar overfitting.
+- [ ] Add optional semantic dedupe/simplification before scoring duplicates.
 
-## Performance
+## Performance Backlog
 - [ ] Cache compiled postfix programs by subtree hash to reduce recompilation overhead.
-- [ ] Add incremental fitness update for local mutations where possible.
-- [ ] Add batch-scoring mode that evaluates many individuals in one Numba call.
+- [ ] Add incremental fitness updates for small local mutations where valid.
+- [ ] Add batch scoring mode that evaluates many individuals in one Numba call.
 - [ ] Add optional process-based parallel mode for non-free-threaded runtimes.
-- [ ] Add profiling mode (`--profile`) that outputs per-stage timing breakdown.
+- [ ] Add profiling mode (`--profile`) with per-stage timing breakdown.
+- [ ] Add adaptive worker policy (auto-tune based on population size + runtime characteristics).
 
-## UX and CLI
-- [ ] Add progress ETA and moving-average generation speed.
-- [ ] Add `--quiet` mode that only prints final summary.
-- [ ] Add `--report-file` for saving final human-readable report.
-- [ ] Add `--csv-log` to stream per-generation metrics to CSV.
-- [ ] Add config file support (`--config path`) for reproducible experiment presets.
+## UX and CLI Backlog
+- [ ] Add progress ETA + moving-average generation speed.
+- [ ] Add `--quiet` mode for final-summary-only output.
+- [ ] Add `--report-file` for human-readable report export.
+- [ ] Add `--csv-log` for per-generation metrics.
+- [ ] Add config file support (`--config path`) for reproducible presets.
+- [ ] Add quality presets (`--preset speed|balanced|quality`) that map to known good parameters.
 
-## Reliability and Testing
-- [ ] Add unit tests for postfix compiler correctness (tree eval == VM eval).
-- [ ] Add unit tests for safe math behavior (div/mod by zero, exponent clamps, clipping).
-- [ ] Add reproducibility tests for fixed seed runs.
-- [ ] Add compatibility CI matrix for Python 3.14 and 3.15.
-- [ ] Add regression tests with known target grids and expected fitness thresholds.
+## Reliability and Testing Backlog
+- [ ] Add unit tests for postfix compiler correctness (`tree.evaluate` parity with VM scoring).
+- [ ] Add unit tests for safe-math guards (div/mod by zero, exponent clamps, clipping).
+- [ ] Add reproducibility tests for fixed-seed single and multi-seed runs.
+- [ ] Add regression tests for known target grids and expected fitness/raw-error thresholds.
+- [ ] Add compatibility CI matrix for Python 3.14 and Python 3.15 fallback mode.
+- [ ] Add non-regression performance check for key workloads (guard against accidental slowdowns).
 
-## Python 3.15 Forward Work
-- [ ] Add optional alternative JIT backend path for 3.15 while Numba support lags.
-- [ ] Add explicit runtime warning that explains why fallback mode is slower on 3.15.
+## Python 3.15+ Forward Work
+- [ ] Add optional alternative acceleration backend for 3.15 while Numba support is incomplete.
+- [ ] Keep fallback warning concise and informative; include measured slowdown guidance in docs.
 - [ ] Re-enable strict Numba requirement on 3.15 once stable wheels are available.
-- [ ] Add one command that validates 3.14 (Numba) and 3.15 (fallback) in one sweep.
+- [ ] Add one command that validates both runtime paths in one sweep:
+  - Python 3.14 + Numba
+  - Python 3.15 + fallback
+- [ ] Track upstream `numba`/`llvmlite` releases and update pins when 3.15 support lands.
