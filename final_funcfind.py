@@ -227,7 +227,7 @@ def _score_program(
     range_target: np.int64,
     abs_limit: np.int64,
     max_exp: np.int64,
-) -> tuple[np.float64, np.int64, np.int64, np.ndarray]:
+) -> tuple[np.float64, np.int64, np.int64]:
     n = expected_flat.shape[0]
     outputs = np.empty(n, dtype=np.int64)
     stack = np.empty(opcodes.shape[0] + 2, dtype=np.int64)
@@ -282,7 +282,7 @@ def _score_program(
         + range_weight * np.float64(range_penalty)
     )
 
-    return fitness, raw_error, symmetry_error, outputs
+    return fitness, raw_error, symmetry_error
 
 
 def _clip_int_py(value: int, abs_limit: int) -> int:
@@ -324,7 +324,10 @@ def _eval_program_point_py(
     max_exp: int,
 ) -> int:
     sp = 0
-    for op, arg in zip(opcodes, operands):
+    n = len(opcodes)
+    for i in range(n):
+        op = opcodes[i]
+        arg = operands[i]
         if op == OP_CONST_I:
             stack[sp] = arg
             sp += 1
@@ -383,7 +386,7 @@ def _score_program_py(
     range_target: int,
     abs_limit: int,
     max_exp: int,
-) -> tuple[float, int, int, np.ndarray]:
+) -> tuple[float, int, int]:
     n = len(expected_flat)
     outputs = [0] * n
     stack = [0] * (len(opcodes) + 2)
@@ -436,7 +439,7 @@ def _score_program_py(
         + range_weight * float(range_penalty)
     )
 
-    return fitness, raw_error, symmetry_error, np.asarray(outputs, dtype=np.int64)
+    return fitness, raw_error, symmetry_error
 
 
 def _ensure_numba_ready() -> None:
@@ -856,11 +859,11 @@ class Individual:
     raw_error: float = float("inf")
     symmetry_error: float = float("inf")
     complexity: int = 0
-    last_outputs: np.ndarray | None = None
     opcodes: np.ndarray | None = None
     operands: np.ndarray | None = None
     opcodes_py: tuple[int, ...] | None = None
     operands_py: tuple[int, ...] | None = None
+    cache_key: tuple[bytes, bytes] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -943,9 +946,10 @@ class GeneticApproximator:
         self.escape_events = 0
         self.score_cache_hits = 0
         self.score_cache_misses = 0
+        self.score_cache_evictions = 0
         self._score_cache: OrderedDict[
             tuple[bytes, bytes],
-            tuple[float, float, float, np.ndarray, int],
+            tuple[float, float, float, int],
         ] = OrderedDict()
         self._score_cache_limit = SCORE_CACHE_LIMIT
 
@@ -958,38 +962,35 @@ class GeneticApproximator:
             self.population.append(Individual(gene=random_node(max_depth=MAX_DEPTH)))
 
     def _score_individual(self, individual: Individual) -> None:
-        if (
-            individual.last_outputs is not None
-            and individual.opcodes is not None
-            and individual.operands is not None
-            and individual.fitness != float("inf")
-        ):
+        if individual.opcodes is not None and individual.operands is not None and individual.fitness != float("inf"):
             return
 
         if individual.opcodes is None or individual.operands is None:
             opcodes, operands = compile_gene_to_postfix(individual.gene)
             individual.opcodes = opcodes
             individual.operands = operands
+            individual.cache_key = (opcodes.tobytes(), operands.tobytes())
+            individual.complexity = int(opcodes.shape[0])
             if not HAS_NUMBA:
                 individual.opcodes_py = tuple(opcodes.tolist())
                 individual.operands_py = tuple(operands.tolist())
 
-        cache_key = (individual.opcodes.tobytes(), individual.operands.tobytes())
+        assert individual.cache_key is not None
+        cache_key = individual.cache_key
         cached = self._score_cache.get(cache_key)
         if cached is not None:
             self.score_cache_hits += 1
             self._score_cache.move_to_end(cache_key)
-            fitness, raw_error, sym_error, outputs, complexity = cached
+            fitness, raw_error, sym_error, complexity = cached
             individual.fitness = fitness
             individual.raw_error = raw_error
             individual.symmetry_error = sym_error
-            individual.last_outputs = outputs
             individual.complexity = complexity
             return
 
         self.score_cache_misses += 1
         if HAS_NUMBA:
-            fitness, raw_error, sym_error, outputs = _score_program(
+            fitness, raw_error, sym_error = _score_program(
                 individual.opcodes,
                 individual.operands,
                 self.x_inputs,
@@ -1015,7 +1016,7 @@ class GeneticApproximator:
             assert self.expected_flat_py is not None
             assert self.symmetry_left_py is not None
             assert self.symmetry_right_py is not None
-            fitness, raw_error, sym_error, outputs = _score_program_py(
+            fitness, raw_error, sym_error = _score_program_py(
                 individual.opcodes_py,
                 individual.operands_py,
                 self.x_inputs_py,
@@ -1042,18 +1043,17 @@ class GeneticApproximator:
         individual.fitness = scored_fitness
         individual.raw_error = scored_raw_error
         individual.symmetry_error = scored_symmetry_error
-        individual.last_outputs = outputs
         individual.complexity = scored_complexity
 
         self._score_cache[cache_key] = (
             scored_fitness,
             scored_raw_error,
             scored_symmetry_error,
-            outputs,
             scored_complexity,
         )
         if len(self._score_cache) > self._score_cache_limit:
             self._score_cache.popitem(last=False)
+            self.score_cache_evictions += 1
 
     def evaluate_population(self) -> None:
         for individual in self.population:
@@ -1073,12 +1073,12 @@ class GeneticApproximator:
         elite.raw_error = parent.raw_error
         elite.symmetry_error = parent.symmetry_error
         elite.complexity = parent.complexity
-        elite.last_outputs = parent.last_outputs
         if parent.opcodes is not None and parent.operands is not None:
             elite.opcodes = parent.opcodes
             elite.operands = parent.operands
             elite.opcodes_py = parent.opcodes_py
             elite.operands_py = parent.operands_py
+            elite.cache_key = parent.cache_key
         return elite
 
     def _bounded_gene(self, gene: Node) -> Node:
@@ -1225,10 +1225,8 @@ class GeneticApproximator:
                 if self.best_seen is None or best.fitness < self.best_seen.fitness:
                     self.best_seen = best
 
-                if best.last_outputs is not None and np.array_equal(best.last_outputs, self.expected_flat):
+                if best.raw_error == 0.0:
                     self.exact_match = True
-                    return best
-                if best.raw_error == 0.0 and best.symmetry_error == 0.0:
                     return best
 
                 self.reproduce()
@@ -1299,7 +1297,7 @@ def _run_once(
     best = solver.run(cfg.generations)
     elapsed = time.perf_counter() - started
 
-    exact_match = bool(best.last_outputs is not None and np.array_equal(best.last_outputs, solver.expected_flat))
+    exact_match = bool(best.raw_error == 0.0)
 
     return {
         "seed": seed,
@@ -1316,6 +1314,7 @@ def _run_once(
         "escape_events": int(solver.escape_events),
         "score_cache_hits": int(solver.score_cache_hits),
         "score_cache_misses": int(solver.score_cache_misses),
+        "score_cache_evictions": int(solver.score_cache_evictions),
         "score_cache_size": int(len(solver._score_cache)),
         "recent_improvement_window_delta": float(solver.last_recent_improvement),
         "acceleration_backend": backend,

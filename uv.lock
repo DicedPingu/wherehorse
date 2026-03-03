@@ -5,7 +5,7 @@ requires-python = ">=3.15"
 [[package]]
 name = "numpy"
 version = "2.5.0.dev0"
-source = { git = "https://github.com/numpy/numpy.git?rev=0abf67d1785abfb4a2ad72fcbe7e00ab09f469b8#0abf67d1785abfb4a2ad72fcbe7e00ab09f469b8" }
+source = { git = "https://github.com/numpy/numpy.git?rev=main#0abf67d1785abfb4a2ad72fcbe7e00ab09f469b8" }
 
 [[package]]
 name = "wherehorse"
@@ -16,4 +16,4 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "numpy", git = "https://github.com/numpy/numpy.git?rev=0abf67d1785abfb4a2ad72fcbe7e00ab09f469b8" }]
+requires-dist = [{ name = "numpy", git = "https://github.com/numpy/numpy.git?rev=main" }]
