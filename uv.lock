@@ -4,9 +4,8 @@ requires-python = ">=3.15"
 
 [[package]]
 name = "numpy"
-version = "2.4.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/57/fd/0005efbd0af48e55eb3c7208af93f2862d4b1a56cd78e84309a2d959208d/numpy-2.4.2.tar.gz", hash = "sha256:659a6107e31a83c4e33f763942275fd278b21d095094044eb35569e86a21ddae", size = 20723651, upload-time = "2026-01-31T23:13:10.135Z" }
+version = "2.5.0.dev0"
+source = { git = "https://github.com/numpy/numpy.git?rev=0abf67d1785abfb4a2ad72fcbe7e00ab09f469b8#0abf67d1785abfb4a2ad72fcbe7e00ab09f469b8" }
 
 [[package]]
 name = "wherehorse"
@@ -17,4 +16,4 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "numpy", specifier = ">=2.4.2" }]
+requires-dist = [{ name = "numpy", git = "https://github.com/numpy/numpy.git?rev=0abf67d1785abfb4a2ad72fcbe7e00ab09f469b8" }]

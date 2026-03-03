@@ -104,6 +104,16 @@ OP_POW = np.int64(6)
 OP_DIV = np.int64(7)
 OP_MOD = np.int64(8)
 
+OP_CONST_I = int(OP_CONST)
+OP_X_I = int(OP_X)
+OP_Y_I = int(OP_Y)
+OP_ADD_I = int(OP_ADD)
+OP_SUB_I = int(OP_SUB)
+OP_MUL_I = int(OP_MUL)
+OP_POW_I = int(OP_POW)
+OP_DIV_I = int(OP_DIV)
+OP_MOD_I = int(OP_MOD)
+
 
 # ---------------------------------------------------------------------------
 # VM core
@@ -273,6 +283,160 @@ def _score_program(
     )
 
     return fitness, raw_error, symmetry_error, outputs
+
+
+def _clip_int_py(value: int, abs_limit: int) -> int:
+    if value > abs_limit:
+        return abs_limit
+    if value < -abs_limit:
+        return -abs_limit
+    return value
+
+
+def _safe_pow_py(base: int, exp: int, max_exp: int, abs_limit: int) -> int:
+    if exp < 0:
+        return 0
+    if exp > max_exp:
+        exp = max_exp
+
+    result = 1
+    for _ in range(exp):
+        result = _clip_int_py(result * base, abs_limit)
+    return result
+
+
+def _trunc_div_py(a: int, b: int) -> int:
+    if b == 0:
+        return 0
+    q = abs(a) // abs(b)
+    if (a < 0 < b) or (a > 0 > b):
+        q = -q
+    return q
+
+
+def _eval_program_point_py(
+    opcodes: tuple[int, ...],
+    operands: tuple[int, ...],
+    x_val: int,
+    y_val: int,
+    stack: list[int],
+    abs_limit: int,
+    max_exp: int,
+) -> int:
+    sp = 0
+    for op, arg in zip(opcodes, operands):
+        if op == OP_CONST_I:
+            stack[sp] = arg
+            sp += 1
+            continue
+        if op == OP_X_I:
+            stack[sp] = x_val
+            sp += 1
+            continue
+        if op == OP_Y_I:
+            stack[sp] = y_val
+            sp += 1
+            continue
+
+        if sp < 2:
+            return 0
+
+        right = stack[sp - 1]
+        left = stack[sp - 2]
+
+        if op == OP_ADD_I:
+            stack[sp - 2] = _clip_int_py(left + right, abs_limit)
+        elif op == OP_SUB_I:
+            stack[sp - 2] = _clip_int_py(left - right, abs_limit)
+        elif op == OP_MUL_I:
+            stack[sp - 2] = _clip_int_py(left * right, abs_limit)
+        elif op == OP_POW_I:
+            stack[sp - 2] = _safe_pow_py(left, right, max_exp, abs_limit)
+        elif op == OP_DIV_I:
+            stack[sp - 2] = _clip_int_py(_trunc_div_py(left, right), abs_limit)
+        elif op == OP_MOD_I:
+            stack[sp - 2] = 0 if right == 0 else _clip_int_py(left % right, abs_limit)
+        else:
+            stack[sp - 2] = 0
+
+        sp -= 1
+
+    if sp != 1:
+        return 0
+    return stack[0]
+
+
+def _score_program_py(
+    opcodes: tuple[int, ...],
+    operands: tuple[int, ...],
+    xs: list[int],
+    ys: list[int],
+    expected_flat: list[int],
+    symmetry_left: list[int],
+    symmetry_right: list[int],
+    complexity_weight: float,
+    diversity_weight: float,
+    symmetry_weight: float,
+    range_weight: float,
+    out_low: int,
+    out_high: int,
+    range_target: int,
+    abs_limit: int,
+    max_exp: int,
+) -> tuple[float, int, int, np.ndarray]:
+    n = len(expected_flat)
+    outputs = [0] * n
+    stack = [0] * (len(opcodes) + 2)
+
+    raw_error = 0
+    diversity_penalty = 0
+    range_penalty = 0
+
+    prev = 0
+    for i in range(n):
+        out = _eval_program_point_py(
+            opcodes,
+            operands,
+            xs[i],
+            ys[i],
+            stack,
+            abs_limit,
+            max_exp,
+        )
+        outputs[i] = out
+
+        diff = expected_flat[i] - out
+        if diff < 0:
+            diff = -diff
+        raw_error += diff
+
+        if i > 0 and out == prev:
+            diversity_penalty += 1
+        prev = out
+
+        if out < out_low or out > out_high:
+            delta = out - range_target
+            if delta < 0:
+                delta = -delta
+            range_penalty += delta
+
+    symmetry_error = 0
+    for l_idx, r_idx in zip(symmetry_left, symmetry_right):
+        sdiff = outputs[l_idx] - outputs[r_idx]
+        if sdiff < 0:
+            sdiff = -sdiff
+        symmetry_error += sdiff
+
+    complexity = len(opcodes)
+    fitness = (
+        float(raw_error)
+        + symmetry_weight * float(symmetry_error)
+        + diversity_weight * float(diversity_penalty)
+        + complexity_weight * float(complexity)
+        + range_weight * float(range_penalty)
+    )
+
+    return fitness, raw_error, symmetry_error, np.asarray(outputs, dtype=np.int64)
 
 
 def _ensure_numba_ready() -> None:
@@ -695,6 +859,8 @@ class Individual:
     last_outputs: np.ndarray | None = None
     opcodes: np.ndarray | None = None
     operands: np.ndarray | None = None
+    opcodes_py: tuple[int, ...] | None = None
+    operands_py: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,6 +899,17 @@ class GeneticApproximator:
                 idx += 1
 
         self.symmetry_left, self.symmetry_right = _build_symmetry_pairs(self.width, self.height)
+        self.x_inputs_py: list[int] | None = None
+        self.y_inputs_py: list[int] | None = None
+        self.expected_flat_py: list[int] | None = None
+        self.symmetry_left_py: list[int] | None = None
+        self.symmetry_right_py: list[int] | None = None
+        if not HAS_NUMBA:
+            self.x_inputs_py = self.x_inputs.tolist()
+            self.y_inputs_py = self.y_inputs.tolist()
+            self.expected_flat_py = self.expected_flat.tolist()
+            self.symmetry_left_py = self.symmetry_left.tolist()
+            self.symmetry_right_py = self.symmetry_right.tolist()
 
         self.population_size = max(4, cfg.population)
         self.mutation_rate = cfg.mutation_rate
@@ -746,6 +923,15 @@ class GeneticApproximator:
         self.stagnation_threshold = cfg.stagnation_threshold
         self.stagnation_refresh = max(0.02, min(0.50, cfg.stagnation_refresh))
         self.stagnation_trigger_rounds = max(6, self.stagnation_window // 4)
+        self._complexity_weight64 = np.float64(self.complexity_weight)
+        self._diversity_weight64 = np.float64(self.diversity_weight)
+        self._symmetry_weight64 = np.float64(self.symmetry_weight)
+        self._range_weight64 = np.float64(RANGE_WEIGHT)
+        self._out_low64 = np.int64(OUT_OF_RANGE_LOW)
+        self._out_high64 = np.int64(OUT_OF_RANGE_HIGH)
+        self._range_target64 = np.int64(RANGE_TARGET)
+        self._output_abs_clip64 = np.int64(OUTPUT_ABS_CLIP)
+        self._pow_exp_clip64 = np.int64(POW_EXP_CLIP)
 
         self.best_fitness_history: list[float] = []
         self.stagnation_counter = 0
@@ -784,6 +970,9 @@ class GeneticApproximator:
             opcodes, operands = compile_gene_to_postfix(individual.gene)
             individual.opcodes = opcodes
             individual.operands = operands
+            if not HAS_NUMBA:
+                individual.opcodes_py = tuple(opcodes.tolist())
+                individual.operands_py = tuple(operands.tolist())
 
         cache_key = (individual.opcodes.tobytes(), individual.operands.tobytes())
         cached = self._score_cache.get(cache_key)
@@ -799,24 +988,51 @@ class GeneticApproximator:
             return
 
         self.score_cache_misses += 1
-        fitness, raw_error, sym_error, outputs = _score_program(
-            individual.opcodes,
-            individual.operands,
-            self.x_inputs,
-            self.y_inputs,
-            self.expected_flat,
-            self.symmetry_left,
-            self.symmetry_right,
-            np.float64(self.complexity_weight),
-            np.float64(self.diversity_weight),
-            np.float64(self.symmetry_weight),
-            np.float64(RANGE_WEIGHT),
-            np.int64(OUT_OF_RANGE_LOW),
-            np.int64(OUT_OF_RANGE_HIGH),
-            np.int64(RANGE_TARGET),
-            np.int64(OUTPUT_ABS_CLIP),
-            np.int64(POW_EXP_CLIP),
-        )
+        if HAS_NUMBA:
+            fitness, raw_error, sym_error, outputs = _score_program(
+                individual.opcodes,
+                individual.operands,
+                self.x_inputs,
+                self.y_inputs,
+                self.expected_flat,
+                self.symmetry_left,
+                self.symmetry_right,
+                self._complexity_weight64,
+                self._diversity_weight64,
+                self._symmetry_weight64,
+                self._range_weight64,
+                self._out_low64,
+                self._out_high64,
+                self._range_target64,
+                self._output_abs_clip64,
+                self._pow_exp_clip64,
+            )
+        else:
+            assert individual.opcodes_py is not None
+            assert individual.operands_py is not None
+            assert self.x_inputs_py is not None
+            assert self.y_inputs_py is not None
+            assert self.expected_flat_py is not None
+            assert self.symmetry_left_py is not None
+            assert self.symmetry_right_py is not None
+            fitness, raw_error, sym_error, outputs = _score_program_py(
+                individual.opcodes_py,
+                individual.operands_py,
+                self.x_inputs_py,
+                self.y_inputs_py,
+                self.expected_flat_py,
+                self.symmetry_left_py,
+                self.symmetry_right_py,
+                self.complexity_weight,
+                self.diversity_weight,
+                self.symmetry_weight,
+                RANGE_WEIGHT,
+                OUT_OF_RANGE_LOW,
+                OUT_OF_RANGE_HIGH,
+                RANGE_TARGET,
+                OUTPUT_ABS_CLIP,
+                POW_EXP_CLIP,
+            )
 
         scored_fitness = float(fitness)
         scored_raw_error = float(raw_error)
@@ -861,6 +1077,8 @@ class GeneticApproximator:
         if parent.opcodes is not None and parent.operands is not None:
             elite.opcodes = parent.opcodes
             elite.operands = parent.operands
+            elite.opcodes_py = parent.opcodes_py
+            elite.operands_py = parent.operands_py
         return elite
 
     def _bounded_gene(self, gene: Node) -> Node:

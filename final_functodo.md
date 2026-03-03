@@ -4,6 +4,7 @@
 - [x] Single-file runner (`final_funcfind.py`) with minimal CLI (`--seed`, `--fast`).
 - [x] Always-on JSON logging to `runs/<run-id>/run.json`.
 - [x] Python 3.15+ project baseline.
+- [x] NumPy sourced from upstream Git commit (dev build, not release wheel).
 - [x] Optional Numba acceleration path with safe Python fallback.
 - [x] Fast preset tuned for short iteration loops.
 
